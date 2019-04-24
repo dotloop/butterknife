@@ -1,11 +1,6 @@
 package butterknife.plugin
 
-import com.android.build.gradle.AppExtension
-import com.android.build.gradle.AppPlugin
-import com.android.build.gradle.FeatureExtension
-import com.android.build.gradle.FeaturePlugin
-import com.android.build.gradle.LibraryExtension
-import com.android.build.gradle.LibraryPlugin
+import com.android.build.gradle.*
 import com.android.build.gradle.api.BaseVariant
 import com.android.build.gradle.internal.res.GenerateLibraryRFileTask
 import com.android.build.gradle.internal.res.LinkApplicationAndroidResourcesTask
@@ -21,7 +16,13 @@ class ButterKnifePlugin : Plugin<Project> {
   override fun apply(project: Project) {
     project.plugins.all {
       when (it) {
-        is FeaturePlugin, is DynamicFeaturePlugin -> {
+        is DynamicFeaturePlugin -> {
+          project.extensions[FeatureExtension::class].run {
+            configureR2Generation(project, featureVariants)
+            configureR2Generation(project, libraryVariants)
+          }
+        }
+        is FeaturePlugin -> {
           project.extensions[FeatureExtension::class].run {
             configureR2Generation(project, featureVariants)
             configureR2Generation(project, libraryVariants)
