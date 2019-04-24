@@ -21,7 +21,7 @@ class ButterKnifePlugin : Plugin<Project> {
   override fun apply(project: Project) {
     project.plugins.all {
       when (it) {
-        is FeaturePlugin -> {
+        is FeaturePlugin, is DynamicFeaturePlugin -> {
           project.extensions[FeatureExtension::class].run {
             configureR2Generation(project, featureVariants)
             configureR2Generation(project, libraryVariants)
