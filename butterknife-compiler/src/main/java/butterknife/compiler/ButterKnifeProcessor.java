@@ -30,11 +30,13 @@ import butterknife.internal.ListenerClass;
 import butterknife.internal.ListenerMethod;
 import com.google.auto.common.SuperficialValidation;
 import com.google.auto.service.AutoService;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.squareup.javapoet.JavaFile;
 import com.squareup.javapoet.TypeName;
 import com.sun.source.util.Trees;
 import com.sun.tools.javac.code.Symbol;
+import com.sun.tools.javac.code.Type;
 import com.sun.tools.javac.tree.JCTree;
 import com.sun.tools.javac.tree.TreeScanner;
 import java.io.IOException;
@@ -48,6 +50,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -74,6 +77,8 @@ import javax.lang.model.type.TypeMirror;
 import javax.lang.model.type.TypeVariable;
 import javax.lang.model.util.Types;
 import javax.tools.Diagnostic.Kind;
+import net.ltgt.gradle.incap.IncrementalAnnotationProcessor;
+import net.ltgt.gradle.incap.IncrementalAnnotationProcessorType;
 
 import static butterknife.internal.Constants.NO_RES_ID;
 import static java.util.Objects.requireNonNull;
@@ -84,6 +89,7 @@ import static javax.lang.model.element.Modifier.PRIVATE;
 import static javax.lang.model.element.Modifier.STATIC;
 
 @AutoService(Processor.class)
+@IncrementalAnnotationProcessor(IncrementalAnnotationProcessorType.DYNAMIC)
 @SuppressWarnings("NullAway") // TODO fix all these...
 public final class ButterKnifeProcessor extends AbstractProcessor {
   // TODO remove when http://b.android.com/187527 is released.
@@ -147,11 +153,28 @@ public final class ButterKnifeProcessor extends AbstractProcessor {
     try {
       trees = Trees.instance(processingEnv);
     } catch (IllegalArgumentException ignored) {
+      try {
+        // Get original ProcessingEnvironment from Gradle-wrapped one or KAPT-wrapped one.
+        for (Field field : processingEnv.getClass().getDeclaredFields()) {
+          if (field.getName().equals("delegate") || field.getName().equals("processingEnv")) {
+            field.setAccessible(true);
+            ProcessingEnvironment javacEnv = (ProcessingEnvironment) field.get(processingEnv);
+            trees = Trees.instance(javacEnv);
+            break;
+          }
+        }
+      } catch (Throwable ignored2) {
+      }
     }
   }
 
   @Override public Set<String> getSupportedOptions() {
-    return ImmutableSet.of(OPTION_SDK_INT, OPTION_DEBUGGABLE);
+    ImmutableSet.Builder<String> builder = ImmutableSet.builder();
+    builder.add(OPTION_SDK_INT, OPTION_DEBUGGABLE);
+    if (trees != null) {
+      builder.add(IncrementalAnnotationProcessorType.ISOLATING.getProcessorOption());
+    }
+    return builder.build();
   }
 
   @Override public Set<String> getSupportedAnnotationTypes() {
@@ -342,6 +365,9 @@ public final class ButterKnifeProcessor extends AbstractProcessor {
       findAndParseListener(env, listener, builderMap, erasedTargetNames);
     }
 
+    Map<TypeElement, ClasspathBindingSet> classpathBindings =
+        findAllSupertypeBindings(builderMap, erasedTargetNames);
+
     // Associate superclass binders with their subclass binders. This is a queue-based tree walk
     // which starts at the roots (superclasses) and walks to the leafs (subclasses).
     Deque<Map.Entry<TypeElement, BindingSet.Builder>> entries =
@@ -353,11 +379,14 @@ public final class ButterKnifeProcessor extends AbstractProcessor {
       TypeElement type = entry.getKey();
       BindingSet.Builder builder = entry.getValue();
 
-      TypeElement parentType = findParentType(type, erasedTargetNames);
+      TypeElement parentType = findParentType(type, erasedTargetNames, classpathBindings.keySet());
       if (parentType == null) {
         bindingMap.put(type, builder.build());
       } else {
-        BindingSet parentBinding = bindingMap.get(parentType);
+        BindingInformationProvider parentBinding = bindingMap.get(parentType);
+        if (parentBinding == null) {
+          parentBinding = classpathBindings.get(parentType);
+        }
         if (parentBinding != null) {
           builder.setParent(parentBinding);
           bindingMap.put(type, builder.build());
@@ -1264,19 +1293,86 @@ public final class ButterKnifeProcessor extends AbstractProcessor {
     return builder;
   }
 
-  /** Finds the parent binder type in the supplied set, if any. */
-  private @Nullable TypeElement findParentType(TypeElement typeElement, Set<TypeElement> parents) {
-    TypeMirror type;
+  /** Finds the parent binder type in the supplied sets, if any. */
+  private @Nullable TypeElement findParentType(
+      TypeElement typeElement, Set<TypeElement> parents, Set<TypeElement> classpathParents) {
     while (true) {
-      type = typeElement.getSuperclass();
-      if (type.getKind() == TypeKind.NONE) {
-        return null;
-      }
-      typeElement = (TypeElement) ((DeclaredType) type).asElement();
-      if (parents.contains(typeElement)) {
+      typeElement = getSuperClass(typeElement);
+      if (typeElement == null || parents.contains(typeElement)
+          || classpathParents.contains(typeElement)) {
         return typeElement;
       }
     }
+  }
+
+  private Map<TypeElement, ClasspathBindingSet> findAllSupertypeBindings(
+      Map<TypeElement, BindingSet.Builder> builderMap, Set<TypeElement> processedInThisRound) {
+    Map<TypeElement, ClasspathBindingSet> classpathBindings = new HashMap<>();
+
+    Set<Class<? extends Annotation>> supportedAnnotations = getSupportedAnnotations();
+    Set<Class<? extends Annotation>> requireViewInConstructor =
+        ImmutableSet.<Class<? extends Annotation>>builder()
+            .addAll(LISTENERS).add(BindView.class).add(BindViews.class).build();
+    supportedAnnotations.removeAll(requireViewInConstructor);
+
+    for (TypeElement typeElement : builderMap.keySet()) {
+      // Make sure to process superclass before subclass. This is because if there is a class that
+      // requires a View in the constructor, all subclasses need it as well.
+      Deque<TypeElement> superClasses = new ArrayDeque<>();
+      TypeElement superClass = getSuperClass(typeElement);
+      while (superClass != null && !processedInThisRound.contains(superClass)
+          && !classpathBindings.containsKey(superClass)) {
+        superClasses.addFirst(superClass);
+        superClass = getSuperClass(superClass);
+      }
+
+      boolean parentHasConstructorWithView = false;
+      while (!superClasses.isEmpty()) {
+        TypeElement superclass = superClasses.removeFirst();
+        ClasspathBindingSet classpathBinding =
+            findBindingInfoForType(superclass, requireViewInConstructor, supportedAnnotations,
+                parentHasConstructorWithView);
+        if (classpathBinding != null) {
+          parentHasConstructorWithView |= classpathBinding.constructorNeedsView();
+          classpathBindings.put(superclass, classpathBinding);
+        }
+      }
+    }
+    return ImmutableMap.copyOf(classpathBindings);
+  }
+
+  private @Nullable ClasspathBindingSet findBindingInfoForType(
+      TypeElement typeElement, Set<Class<? extends Annotation>> requireConstructorWithView,
+      Set<Class<? extends Annotation>> otherAnnotations, boolean needsConstructorWithView) {
+    boolean foundSupportedAnnotation = false;
+    for (Element enclosedElement : typeElement.getEnclosedElements()) {
+      for (Class<? extends Annotation> bindViewAnnotation : requireConstructorWithView) {
+        if (enclosedElement.getAnnotation(bindViewAnnotation) != null) {
+          return new ClasspathBindingSet(true, typeElement);
+        }
+      }
+      for (Class<? extends Annotation> supportedAnnotation : otherAnnotations) {
+        if (enclosedElement.getAnnotation(supportedAnnotation) != null) {
+          if (needsConstructorWithView) {
+            return new ClasspathBindingSet(true, typeElement);
+          }
+          foundSupportedAnnotation = true;
+        }
+      }
+    }
+    if (foundSupportedAnnotation) {
+      return new ClasspathBindingSet(false, typeElement);
+    } else {
+      return null;
+    }
+  }
+
+  private @Nullable TypeElement getSuperClass(TypeElement typeElement) {
+    TypeMirror type = typeElement.getSuperclass();
+    if (type.getKind() == TypeKind.NONE) {
+      return null;
+    }
+    return (TypeElement) ((DeclaredType) type).asElement();
   }
 
   @Override public SourceVersion getSupportedSourceVersion() {
@@ -1359,16 +1455,38 @@ public final class ButterKnifeProcessor extends AbstractProcessor {
   private static class RScanner extends TreeScanner {
     Map<Integer, Id> resourceIds = new LinkedHashMap<>();
 
+    @Override
+    public void visitIdent(JCTree.JCIdent jcIdent) {
+      super.visitIdent(jcIdent);
+      Symbol symbol = jcIdent.sym;
+      if (symbol.type instanceof Type.JCPrimitiveType) {
+        Id id = parseId(symbol);
+        if (id != null) {
+          resourceIds.put(id.value, id);
+        }
+      }
+    }
+
     @Override public void visitSelect(JCTree.JCFieldAccess jcFieldAccess) {
       Symbol symbol = jcFieldAccess.sym;
+      Id id = parseId(symbol);
+      if (id != null) {
+        resourceIds.put(id.value, id);
+      }
+    }
+
+    @Nullable
+    private Id parseId(Symbol symbol) {
+      Id id = null;
       if (symbol.getEnclosingElement() != null
           && symbol.getEnclosingElement().getEnclosingElement() != null
           && symbol.getEnclosingElement().getEnclosingElement().enclClass() != null) {
         try {
           int value = (Integer) requireNonNull(((Symbol.VarSymbol) symbol).getConstantValue());
-          resourceIds.put(value, new Id(value, symbol));
+          id = new Id(value, symbol);
         } catch (Exception ignored) { }
       }
+      return id;
     }
 
     @Override public void visitLiteral(JCTree.JCLiteral jcLiteral) {
